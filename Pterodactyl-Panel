@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # --------------------------------------------------------------
-# Pterodactyl Panel – local‑only installer for Raspberry Pi OS
+# Pterodactyl Panel – LAN‑only installer for Raspberry Pi OS
 # --------------------------------------------------------------
 # What it does:
 #   • Installs Nginx, MariaDB, Redis, PHP‑8.2, Composer, Git, …
-#   • Sets up a local MySQL database (no remote access)
+#   • Creates a local MySQL database (no remote access)
 #   • Downloads the latest panel release, configures .env
-#   • Runs migrations, seeds, creates an admin user
-#   • Configures Nginx to bind to 127.0.0.1:80 (HTTP only)
+#   • Runs migrations, seeds, creates an admin user (no prompts)
+#   • Configures Nginx to listen on the Pi's LAN IP (or 0.0.0.0)
+#   • Sets up a tiny ufw firewall that only allows HTTP from the LAN
 #   • Installs a systemd service for the queue worker (pteroq)
 #   • Prints a short “install summary”
 #
@@ -23,9 +24,10 @@ set -euo pipefail   # abort on error, treat unset vars as errors
 # -------------------------------------------------------------------------
 # 1️⃣  USER‑CONFIGURABLE SETTINGS – change them before you run the script
 # -------------------------------------------------------------------------
-APP_DOMAIN="localhost"                     # only used for the .env file
-APP_URL="http://localhost"                 # panel URL (no HTTPS)
-APP_DIR="/var/www/pterodactyl"              # where the panel will live
+# If you want a custom domain (e.g. panel.local) you can set APP_DOMAIN
+# to that value.  The script will still bind to the LAN IP.
+APP_DOMAIN="panel.local"
+APP_DIR="/var/www/pterodactyl"
 DB_NAME="panel"
 DB_USER="pterodactyl"
 DB_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"   # random DB password
@@ -40,14 +42,27 @@ TIMEZONE="$(cat /etc/timezone 2>/dev/null || echo 'UTC')"
 # 2️⃣  INTERNAL VARIABLES – do NOT edit unless you know what you’re doing
 # -------------------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-PHP_VERSION="8.2"                     # the version that ships with Pi OS (adjust if you add a PPA)
+PHP_VERSION="8.2"                     # version shipped with Pi OS
 PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
 COMPOSER_BIN="/usr/local/bin/composer"
 NGINX_CONF="/etc/nginx/sites-available/pterodactyl"
 NGINX_LINK="/etc/nginx/sites-enabled/pterodactyl"
 
 # -------------------------------------------------------------------------
-# 3️⃣  PRE‑FLIGHT CHECKS
+# 3️⃣  HELPERS
+# -------------------------------------------------------------------------
+env_set() {
+    # $1 = key, $2 = value
+    local key=$1 value=$2
+    if grep -q "^${key}=" .env; then
+        sed -i "s|^${key}=.*|${key}=${value}|g" .env
+    else
+        echo "${key}=${value}" >> .env
+    fi
+}
+
+# -------------------------------------------------------------------------
+# 4️⃣  PRE‑FLIGHT CHECKS
 # -------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     echo "❌  This script must be run as root. Use: sudo $0"
@@ -65,9 +80,23 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 # -------------------------------------------------------------------------
-# 4️⃣  UPDATE & INSTALL DEPENDENCIES
+# 5️⃣  DETERMINE LAN IP (the address that other Wi‑Fi devices will use)
 # -------------------------------------------------------------------------
-echo "🔧  [1/9] Updating package list and installing required packages…"
+# We look for the first non‑loopback, non‑docker, IPv4 address.
+LAN_IP=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || true)
+
+if [[ -z "$LAN_IP" ]]; then
+    echo "⚠️  Could not auto‑detect a LAN IP. Falling back to 0.0.0.0 (listen on all interfaces)."
+    LAN_IP="0.0.0.0"
+fi
+
+APP_URL="http://${LAN_IP}"
+echo "🔎  Detected LAN IP: $LAN_IP → APP_URL will be $APP_URL"
+
+# -------------------------------------------------------------------------
+# 6️⃣  UPDATE & INSTALL DEPENDENCIES
+# -------------------------------------------------------------------------
+echo "🔧  [1/10] Updating package list and installing required packages…"
 apt-get update -y
 apt-get upgrade -y
 
@@ -78,7 +107,7 @@ apt-get install -y \
     php${PHP_VERSION}-fpm php${PHP_VERSION}-cli php${PHP_VERSION}-mysql php${PHP_VERSION}-gd \
     php${PHP_VERSION}-zip php${PHP_VERSION}-mbstring php${PHP_VERSION}-bcmath php${PHP_VERSION}-xml \
     php${PHP_VERSION}-curl php${PHP_VERSION}-intl php${PHP_VERSION}-redis \
-    curl unzip git ca-certificates gnupg lsb-release software-properties-common
+    curl unzip git ca-certificates gnupg lsb-release software-properties-common ufw
 
 # Enable & start services
 systemctl enable --now mariadb
@@ -87,10 +116,10 @@ systemctl enable --now nginx
 systemctl enable --now "${PHP_FPM_SERVICE}"
 
 # -------------------------------------------------------------------------
-# 5️⃣  INSTALL COMPOSER (global)
+# 7️⃣  INSTALL COMPOSER (global)
 # -------------------------------------------------------------------------
 if ! command -v composer >/dev/null 2>&1; then
-    echo "🔧  [2/9] Installing Composer…"
+    echo "🔧  [2/10] Installing Composer…"
     EXPECTED_CHECKSUM="$(curl -s https://composer.github.io/installer.sig)"
     php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
     ACTUAL_CHECKSUM="$(php -r "echo hash_file('sha384', 'composer-setup.php');")"
@@ -106,10 +135,10 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# 6️⃣  DATABASE SETUP (local only)
+# 8️⃣  DATABASE SETUP (local only)
 # -------------------------------------------------------------------------
-echo "🔧  [3/9] Creating MySQL database and user…"
-# Secure MariaDB root account with unix_socket (default on Pi OS) – no password needed for local root
+echo "🔧  [3/10] Creating MySQL database and user…"
+# MariaDB on Pi OS uses unix_socket auth for root, so we can run as root without a password.
 mysql -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'127.0.0.1' IDENTIFIED BY '${DB_PASS}';
@@ -118,48 +147,40 @@ FLUSH PRIVILEGES;
 SQL
 
 # -------------------------------------------------------------------------
-# 7️⃣  DOWNLOAD & SETUP PTERODACTYL PANEL
+# 9️⃣  DOWNLOAD & SETUP PTERODACTYL PANEL
 # -------------------------------------------------------------------------
-echo "🔧  [4/9] Downloading latest Pterodactyl Panel…"
+echo "🔧  [4/10] Downloading latest Pterodactyl Panel…"
 mkdir -p "${APP_DIR}"
 cd "$(dirname "${APP_DIR}")"
-# Grab the latest release tarball from GitHub (API fallback if GitHub rate‑limits)
+
+# Grab the latest release tarball from GitHub (fallback to static URL if API rate‑limited)
 LATEST_URL=$(curl -s https://api.github.com/repos/pterodactyl/panel/releases/latest \
     | grep browser_download_url | grep ".tar.gz" | cut -d '"' -f 4)
+
 if [[ -z "$LATEST_URL" ]]; then
     echo "❌  Could not fetch latest release URL – aborting."
     exit 1
 fi
+
 curl -L "$LATEST_URL" -o panel.tar.gz
 tar -xzf panel.tar.gz --strip-components=1 -C "${APP_DIR}"
 rm panel.tar.gz
 
-# Set proper ownership (nginx runs as www-data)
+# Permissions – Nginx runs as www-data
 chown -R www-data:www-data "${APP_DIR}"
 chmod -R 755 "${APP_DIR}"
 
 # -------------------------------------------------------------------------
-# 8️⃣  LARAVEL .ENV CONFIGURATION
+# 🔟  LARAVEL .ENV CONFIGURATION
 # -------------------------------------------------------------------------
-echo "🔧  [5/9] Preparing Laravel .env file…"
+echo "🔧  [5/10] Preparing Laravel .env file…"
 cd "${APP_DIR}"
 cp .env.example .env
 
-# Helper to replace or add a line in .env
-env_set() {
-    local key=$1
-    local value=$2
-    if grep -q "^${key}=" .env; then
-        sed -i "s|^${key}=.*|${key}=${value}|g" .env
-    else
-        echo "${key}=${value}" >> .env
-    fi
-}
-
 env_set "APP_URL" "${APP_URL}"
 env_set "APP_TIMEZONE" "${TIMEZONE}"
-env_set "APP_ENV" "local"
-env_set "APP_DEBUG" "true"
+env_set "APP_ENV" "production"
+env_set "APP_DEBUG" "false"
 env_set "DB_CONNECTION" "mysql"
 env_set "DB_HOST" "127.0.0.1"
 env_set "DB_PORT" "3306"
@@ -174,26 +195,25 @@ env_set "REDIS_PASSWORD" "null"
 env_set "REDIS_PORT" "6379"
 
 # -------------------------------------------------------------------------
-# 9️⃣  COMPOSER DEPENDENCIES & LARAVEL KEY
+# 1️⃣1️⃣  COMPOSER DEPENDENCIES & LARAVEL KEY
 # -------------------------------------------------------------------------
-echo "🔧  [6/9] Installing PHP dependencies via Composer…"
+echo "🔧  [6/10] Installing PHP dependencies via Composer…"
 sudo -u www-data composer install --no-dev --optimize-autoloader
 
-echo "🔧  [7/9] Generating application key…"
+echo "🔧  [7/10] Generating application key…"
 sudo -u www-data php artisan key:generate --force
 
 # -------------------------------------------------------------------------
-# 🔟  DATABASE MIGRATIONS & SEEDING
+# 1️⃣2️⃣  DATABASE MIGRATIONS & SEEDING
 # -------------------------------------------------------------------------
-echo "🔧  [8/9] Running migrations and seeding…"
+echo "🔧  [8/10] Running migrations and seeding…"
 sudo -u www-data php artisan migrate --seed --force
 
 # -------------------------------------------------------------------------
-# 1️⃣1️⃣  CREATE ADMIN USER (non‑interactive)
+# 1️⃣3️⃣  CREATE ADMIN USER (non‑interactive)
 # -------------------------------------------------------------------------
-echo "🔧  [9/9] Creating admin user…"
-# The `p:create:user` command can receive all arguments via STDIN
-ADMIN_CMD=$(cat <<EOF
+echo "🔧  [9/10] Creating admin user…"
+ADMIN_INPUT=$(cat <<EOF
 ${ADMIN_EMAIL}
 ${ADMIN_USERNAME}
 ${ADMIN_FIRST}
@@ -203,15 +223,16 @@ ${ADMIN_PASS}
 y
 EOF
 )
-echo "$ADMIN_CMD" | sudo -u www-data php artisan p:user:make --admin --no-interaction
+echo "$ADMIN_INPUT" | sudo -u www-data php artisan p:user:make --admin --no-interaction
 
 # -------------------------------------------------------------------------
-# 1️⃣2️⃣  NGINX CONFIGURATION (local‑only)
+# 1️⃣4️⃣  NGINX CONFIGURATION (LAN‑only)
 # -------------------------------------------------------------------------
-echo "🔧  Configuring Nginx (binds to 127.0.0.1:80)…"
+echo "🔧  [10/10] Configuring Nginx (listen on ${LAN_IP:-0.0.0.0})…"
 cat > "${NGINX_CONF}" <<NGX
 server {
-    listen 127.0.0.1:80;
+    # Listen on the detected LAN IP; if detection failed we fall back to 0.0.0.0
+    listen ${LAN_IP}:80;
     server_name ${APP_DOMAIN};
 
     root ${APP_DIR}/public;
@@ -249,7 +270,30 @@ ln -sf "${NGINX_CONF}" "${NGINX_LINK}"
 nginx -t && systemctl reload nginx
 
 # -------------------------------------------------------------------------
-# 1️⃣3️⃣  QUEUE WORKER SERVICE (pteroq)
+# 1️⃣5️⃣  FIREWALL – allow HTTP only from the local subnet
+# -------------------------------------------------------------------------
+echo "🔧  Setting up ufw firewall (allow LAN, block everything else)…"
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+
+# Allow SSH (so you don’t lock yourself out)
+ufw allow OpenSSH
+
+# Allow HTTP from the local subnet (assumes /24 – adjust if you use a different mask)
+LAN_SUBNET=$(ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.0/24' | head -n1 || true)
+if [[ -z "$LAN_SUBNET" ]]; then
+    # Fallback – allow from any 192.168.*.* and 10.*.*.* networks
+    ufw allow from 192.168.0.0/16 to any port 80 comment "Pterodactyl LAN"
+    ufw allow from 10.0.0.0/8 to any port 80 comment "Pterodactyl LAN"
+else
+    ufw allow from "${LAN_SUBNET}" to any port 80 comment "Pterodactyl LAN"
+fi
+
+ufw enable
+
+# -------------------------------------------------------------------------
+# 1️⃣6️⃣  QUEUE WORKER SERVICE (pteroq)
 # -------------------------------------------------------------------------
 echo "🔧  Installing systemd service for the queue worker (pteroq)…"
 cat > /etc/systemd/system/pteroq.service <<SERVICE
@@ -262,13 +306,7 @@ User=www-data
 Group=www-data
 Restart=always
 WorkingDirectory=${APP_DIR}
-ExecStart=${PHP_FPM_SERVICE} -d variables_order=EGPCS -r 'while (true) { exec("php artisan queue:work --queue=high,standard,low --sleep=3 --tries=3"); sleep(1); }'
-
-# The above line runs the Laravel queue worker in a loop – it’s the
-# same approach the official docs use for a simple systemd unit.
-# If you prefer the “php artisan queue:work --daemon” style, replace
-# the ExecStart line with:
-# ExecStart=/usr/bin/php ${APP_DIR}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3 --daemon
+ExecStart=/usr/bin/php ${APP_DIR}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
 
 [Install]
 WantedBy=multi-user.target
@@ -278,7 +316,7 @@ systemctl daemon-reload
 systemctl enable --now pteroq
 
 # -------------------------------------------------------------------------
-# 1️⃣4️⃣  FINAL SUMMARY
+# 1️⃣7️⃣  FINAL SUMMARY
 # -------------------------------------------------------------------------
 echo
 echo "============================================================"
@@ -294,12 +332,16 @@ echo "  Name             : ${DB_NAME}"
 echo "  User             : ${DB_USER}"
 echo "  Password         : ${DB_PASS}"
 echo
-echo "Nginx is listening only on 127.0.0.1:80 – the panel is NOT"
-echo "exposed to the outside world.  Open a browser on the Pi"
-echo "or use an SSH tunnel (e.g. ssh -L 8080:127.0.0.1:80 pi@yourpi) "
-echo "to reach it from another machine."
+echo "Nginx is listening on ${LAN_IP}:80 – any device on the same Wi‑Fi"
+echo "subnet can open http://${LAN_IP} (or http://${APP_DOMAIN} if you set up"
+echo "local DNS/hosts entries)."
 echo
-echo "Queue worker (pteroq) is running as a systemd service."
+echo "UFW firewall:"
+echo "  • SSH (port 22) is allowed"
+echo "  • HTTP (port 80) is allowed only from the local subnet"
+echo "  • All other inbound traffic is blocked"
+echo
+echo "Queue worker (pteroq) runs as a systemd service."
 echo "If you ever need to restart it: sudo systemctl restart pteroq"
 echo "============================================================"
 echo
