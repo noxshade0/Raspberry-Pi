@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Pterodactyl Panel local-only installer for Raspberry Pi (Debian-based)
+# - No HTTPS, binds to 127.0.0.1
+# - Minimal/no prompts
+# - Sets up Nginx, PHP-FPM, MariaDB, Redis, Composer, Pterodactyl, and queue worker
+set -euo pipefail
+
+# ----------------------------
+# Config (you can tweak if needed)
+# ----------------------------
+APP_DOMAIN="localhost"
+APP_URL="http://localhost"
+APP_DIR="/var/www/pterodactyl"
+DB_NAME="panel"
+DB_USER="pterodactyl"
+DB_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+ADMIN_EMAIL="admin@local"
+ADMIN_USERNAME="admin"
+ADMIN_FIRST="Local"
+ADMIN_LAST="Admin"
+ADMIN_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)"
+TIMEZONE="$(cat /etc/timezone 2>/dev/null || echo 'UTC')"
+
+# Noninteractive apt
+export DEBIAN_FRONTEND=noninteractive
+
+# ----------------------------
+# Pre-flight checks
+# ----------------------------
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root: sudo bash $0"
+  exit 1
+fi
+
+if [[ -d "$APP_DIR" ]]; then
+  echo "Directory $APP_DIR already exists. Aborting to avoid overwriting."
+  exit 1
+fi
+
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "This script expects a Debian-based system (Raspberry Pi OS)."
+  exit 1
+fi
+
+# ----------------------------
+# Update and install dependencies
+# ----------------------------
+echo "[1/8] Installing system packages..."
+apt-get update -y
+apt-get upgrade -y
+apt-get install -y \
+  nginx mariadb-server redis-server \
+  php-fpm php-cli php-mysql php-gd php-zip php-mbstring php-bcmath php-xml php-curl php-intl php-redis \
+  curl unzip git ca-certificates gnupg lsb-release software-properties-common
+
+# Ensure services running
+systemctl enable --now mariadb || true
+systemctl enable --now redis-server || true
+systemctl enable --now nginx || true
+systemctl enable --now php*-fpm.service || true
+
+# ----------------------------
+# Database setup (local only)
+# ----------------------------
+echo "[2/8] Configuring
